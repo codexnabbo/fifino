@@ -16,3 +16,5 @@ bin/
 **/.DS_Store
 *.swp
 *~
+
+test.zig
