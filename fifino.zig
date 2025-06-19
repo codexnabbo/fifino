@@ -8,6 +8,8 @@ const editorConfig = struct {
     cursorY: u16,
     screenrows: u16,
     screencols: u16,
+    numrows: u16,
+    row: EditorRow,
     orig_termios: std.c.termios = undefined,
 
 };
@@ -22,6 +24,32 @@ const editorKey = enum(u16) {
     HOME_KEY,
     END_KEY,
     DEL_KEY,
+};
+
+const EditorRow = struct {
+    chars: []u8,
+    allocator: Allocator,
+
+    const Self = @This();
+
+    pub fn init(allocator: Allocator, content: []const u8) !Self {
+        const chars = try allocator.dupe(u8, content);
+        return Self{
+            .chars = chars,
+           .allocator = allocator,
+        };
+    }
+
+    pub fn deinit(self: *Self) void {
+        self.allocator.free(self.chars);
+    }
+    
+    pub fn append(self: *Self, s: []const u8) !void {
+        const new_size = self.chars.len + s.len;
+        self.chars = try self.allocator.realloc(self.chars, new_size);
+        @memcpy(self.chars[self.chars.len - s.len..], s);
+    }
+
 };
 
 const abuf = struct {
@@ -152,23 +180,49 @@ fn getWindowSize(rows: *u16, cols: *u16) !i8 {
     }
     return 0;
 }
-// ------- append buffer ------/
-
-fn abAppend(ab: abuf,s: *u8,len: u8) void {
+// ------- file i/o ----- //
     
-   var new = std.mem.Allocator.realloc(ab.b, ab.len + len, );
+fn editorOpen(allocator: Allocator, file_path: []const u8) !void {
+    const fp = std.fs.cwd().openFile(file_path, .{ .mode = std.fs.File.OpenMode.read_only}) catch |err| {
+        switch (err) {
+            error.FileNotFound => die("OpenFile: File not Found"),
+            error.AccessDenied => die("OpenFIle: Access denied"),
+            else => die("OpenFile: Unknow Error"),
+        }
+        return err;
+    };
+    defer fp.close();
 
-    if (new == null) return;
-    @memcpy(&new[ab.len], s);
+    var buf_reader = std.io.bufferedReader(fp.reader());
+    var in_stream = buf_reader.reader();
+
+    var line_buffer: [4096]u8 = undefined;
+
+    if(in_stream.readUntilDelimiterOrEof(line_buffer[0..], '\n')) |maybe_line| {
+        if(maybe_line) |line| {
+            var linelen = line.len;
+
+            while (linelen > 0 and (line[linelen - 1] == '\n' or line[linelen - 1] == '\r')) {
+                linelen -= 1;
+            }
+
+            std.debug.print("{s}", .{line});
+            E.row.chars = try allocator.alloc(u8, linelen+1);
+            try E.row.append(line);
+            E.row.chars[linelen] = 0;
+            E.numrows = 1;
+        }
+    } else |_| {}
 }
 
-// ------- output -------//
+// ------- output ------- //
 
 fn editorDrawRows(ab: *abuf) !void {
 
     for(0..E.screenrows) |index| {
         //_ = std.c.write(std.c.STDIN_FILENO, "~",1);
         var buf: [80]u8 = undefined;
+        if (index >= E.numrows) {
         if(index == E.screenrows / 3){
             const slice = try std.fmt.bufPrint(&buf,"Fifino editor - version: {s}", .{version});
             var welcome_len = slice.len;
@@ -182,6 +236,11 @@ fn editorDrawRows(ab: *abuf) !void {
         }else{
         try ab.append("~");
         }
+    } else {
+            var len = E.row.chars.len;
+            if(len > E.screencols) len = E.screencols;
+            try ab.append(E.row.chars);
+        }
         try ab.append("\x1b[K");
         if(index < E.screenrows - 1 ){
             //_ = std.c.write(std.c.STDIN_FILENO,"\r\n", 2);
@@ -190,18 +249,9 @@ fn editorDrawRows(ab: *abuf) !void {
     }
 }
 
-fn editorRefreshScreen() !void {
+fn editorRefreshScreen(allocator: Allocator) !void {
 
-    var gpa = std.heap.DebugAllocator(.{}).init;
-    defer {
-        const check = gpa.deinit();
-        switch (check) {
-            .leak =>  std.io.getStdErr().writer().print("Memory leak detected", .{}) catch {},
-            .ok => {},
-        }
-    }
-    const allocator = gpa.allocator();
-
+    
     var ab = abuf.init(allocator);
     defer ab.free();
 
@@ -352,18 +402,32 @@ fn editorProcessKeypress() !void {
 
 // ------- init --------//
 
-fn initEditor() !void {
+fn initEditor(allocator: Allocator) !void {
     E.cursorX = 0;
     E.cursorY =0;
+    E.numrows = 0;
+    E.row = try EditorRow.init(allocator, "");
     if (try getWindowSize(&E.screenrows, &E.screencols) == -1) die("getWindowSize");
 }
 
 pub fn main() !void{
-   enableRawMode();
-    try initEditor();
+    var gpa = std.heap.DebugAllocator(.{}).init;
+    defer {
+        const check = gpa.deinit();
+        switch (check) {
+            .leak =>  std.io.getStdErr().writer().print("Memory leak detected", .{}) catch {},
+            .ok => {},
+        }
+    }
+    const allocator = gpa.allocator();
+
+    enableRawMode();
+    try initEditor(allocator);
+    if (std.os.argv.len > 1) try editorOpen(allocator, std.mem.span(std.os.argv[1]));
     while (true) {
-        try editorRefreshScreen();
+        try editorRefreshScreen(allocator);
         try editorProcessKeypress();
-     }
+        
+    }
     defer exit(0);
 }
