@@ -1,17 +1,22 @@
 const std = @import("std");
+const Logger = @import("logger.zig").Logger;
+const Config = @import("constant.zig");
+var log: Logger = undefined;
 const Allocator = std.mem.Allocator;
-
-const version = "0.0.1";
 
 const editorConfig = struct {
     cursorX: u16,
     cursorY: u16,
+    renderX: u16,
     rowoff: u16,
     coloff: u16,
     screenrows: u16,
     screencols: u16,
     numrows: u16,
     row: []EditorRow,
+    filename: ?[]u8,
+    statusmsg: [80]u8,
+    statusmsg_time: i64,
     orig_termios: std.c.termios = undefined,
 };
 
@@ -29,6 +34,8 @@ const editorKey = enum(u16) {
 
 const EditorRow = struct {
     chars: []u8,
+    rsize: u16,
+    render: []u8,
     allocator: Allocator,
 
     const Self = @This();
@@ -37,6 +44,8 @@ const EditorRow = struct {
         const chars = try allocator.dupe(u8, content);
         return Self{
             .chars = chars,
+            .rsize = 0,
+            .render = undefined,
             .allocator = allocator,
         };
     }
@@ -180,6 +189,46 @@ fn getWindowSize(rows: *u16, cols: *u16) !i8 {
     return 0;
 }
 
+fn editorRowCxToRx(row: *EditorRow, cx: u16) u16 {
+    var rx: u16 = 0;
+    for (0..cx) |i| {
+        if (row.chars[i] == '\t')
+            rx += (Config.TAB_STOP - 1) - (rx % Config.TAB_STOP);
+
+        rx += 1;
+    }
+
+    return rx;
+}
+
+fn editorUpdateRow(row: *EditorRow) !void {
+    var tabs: u16 = 0;
+
+    for (0..row.chars.len) |i| {
+        if (row.chars[i] == '\t') tabs += 1;
+    }
+
+    row.render = try row.allocator.alloc(u8, row.chars.len + tabs * (Config.TAB_STOP - 1) + 1);
+
+    var idx: u16 = 0;
+    for (0..row.chars.len) |i| {
+        if (row.chars[i] == '\t') {
+            row.render[idx] = ' ';
+            idx += 1;
+            while (idx % Config.TAB_STOP != 0) : (idx += 1) {
+                row.render[idx] = ' ';
+            }
+        } else {
+            row.render[idx] = row.chars[i];
+            idx += 1;
+        }
+    }
+    row.render[idx] = 0;
+    try log.logWithTimestampf("row.render = {s}", .{row.render});
+    try log.logWithTimestampf("idx length: {d}", .{idx});
+    row.rsize = idx;
+}
+
 fn editorAppendRow(allocator: Allocator, line: []const u8, len: usize) !void {
     const new_size = std.math.mul(usize, E.numrows + 1, @sizeOf(EditorRow)) catch {
         return error.CalculationOverflow;
@@ -187,12 +236,16 @@ fn editorAppendRow(allocator: Allocator, line: []const u8, len: usize) !void {
     E.row = try allocator.realloc(E.row, new_size);
 
     E.row[E.numrows] = try EditorRow.init(allocator, line[0..len]);
+    E.row[E.numrows].rsize = 0;
+    E.row[E.numrows].render = undefined;
+    try editorUpdateRow(&E.row[E.numrows]);
     E.numrows += 1;
 }
 
 // ------- file i/o ----- //
 
 fn editorOpen(allocator: Allocator, file_path: []const u8) !void {
+    E.filename = try allocator.dupe(u8, file_path);
     const fp = std.fs.cwd().openFile(file_path, .{ .mode = std.fs.File.OpenMode.read_only }) catch |err| {
         switch (err) {
             error.FileNotFound => die("OpenFile: File not Found"),
@@ -226,17 +279,22 @@ fn editorOpen(allocator: Allocator, file_path: []const u8) !void {
 
 // ------- output ------- //
 fn editorScroll() void {
+    E.renderX = 0;
+    if (E.cursorY < E.numrows) {
+        E.renderX = editorRowCxToRx(&E.row[E.cursorY], E.cursorX);
+    }
+
     if (E.cursorY < E.rowoff) {
         E.rowoff = E.cursorY;
     }
     if (E.cursorY >= E.rowoff + E.screenrows) {
         E.rowoff = E.cursorY - E.screenrows + 1;
     }
-    if (E.cursorX < E.coloff) {
-        E.coloff = E.cursorX;
+    if (E.renderX < E.coloff) {
+        E.coloff = E.renderX;
     }
-    if (E.cursorX >= E.coloff + E.screencols) {
-        E.coloff = E.cursorX - E.screencols + 1;
+    if (E.renderX >= E.coloff + E.screencols) {
+        E.coloff = E.renderX - E.screencols + 1;
     }
 }
 
@@ -247,7 +305,7 @@ fn editorDrawRows(ab: *abuf) !void {
         var buf: [80]u8 = undefined;
         if (filerow >= E.numrows) {
             if (E.numrows == 0 and index == E.screenrows / 3) {
-                const slice = try std.fmt.bufPrint(&buf, "Fifino editor - version: {s}", .{version});
+                const slice = try std.fmt.bufPrint(&buf, "Fifino editor - version: {s}", .{Config.VERSION});
                 var welcome_len = slice.len;
                 if (welcome_len > E.screencols) welcome_len = E.screencols;
                 var padding = (E.screencols - welcome_len) / 2;
@@ -261,26 +319,54 @@ fn editorDrawRows(ab: *abuf) !void {
             }
         } else {
             const row = &E.row[filerow];
-            const row_len = row.chars.len;
+            const row_len = row.render.len;
 
             if (@as(usize, E.coloff) < row_len) {
                 const start = @as(usize, E.coloff);
                 const available_chars = row_len - start;
                 const chars_to_show = @min(available_chars, @as(usize, E.screencols));
                 const end = start + chars_to_show;
-
-                try ab.append(row.chars[start..end]);
+                try ab.append(row.render[start..end]);
             }
             //try ab.append(E.row[filerow].chars[start..end]);
         }
         try ab.append("\x1b[K");
-        if (index < E.screenrows - 1) {
-            //_ = std.c.write(std.c.STDIN_FILENO,"\r\n", 2);
-            try ab.append("\r\n");
-        }
+        //_ = std.c.write(std.c.STDIN_FILENO,"\r\n", 2);
+        try ab.append("\r\n");
     }
 }
 
+fn editorDrawStatusBar(ab: *abuf) !void {
+    try ab.append("\x1b[7m");
+    var len: usize = 0;
+
+    var buf: [80]u8 = undefined;
+    var status: [80]u8 = undefined;
+    const fname = try std.fmt.bufPrint(&buf, "{s:.20} - {d} lines", .{ if (E.filename) |f| f else "[No Name]", E.numrows });
+    const lnumber = try std.fmt.bufPrint(&status, "{d}/{d}", .{ E.cursorY + 1, E.numrows });
+    try log.logWithTimestampf("{s}", .{lnumber});
+    try ab.append(fname);
+
+    len = fname.len;
+    while (len < E.screencols) : (len += 1) {
+        if (E.screencols - len == lnumber.len) {
+            try ab.append(lnumber);
+            break;
+        } else {
+            try ab.append(" ");
+        }
+    }
+    try ab.append("\x1b[m");
+    try ab.append("\r\n");
+}
+
+fn editorDrawMessageBar(ab: *abuf) !void {
+    try ab.append("\x1b[K");
+
+    const msglen = if (E.statusmsg.len > E.screencols) E.screencols else E.statusmsg.len;
+    if (std.time.timestamp() - E.statusmsg_time < 5)
+        try ab.append(E.statusmsg[0..msglen]);
+}
 fn editorRefreshScreen(allocator: Allocator) !void {
     editorScroll();
 
@@ -291,9 +377,11 @@ fn editorRefreshScreen(allocator: Allocator) !void {
     try ab.append("\x1b[H");
 
     try editorDrawRows(&ab);
+    try editorDrawStatusBar(&ab);
+    try editorDrawMessageBar(&ab);
 
     var buf: [32]u8 = undefined;
-    const movedCursor = try std.fmt.bufPrint(&buf, "\x1b[{d};{d}H", .{ (E.cursorY - E.rowoff) + 1, (E.cursorX - E.coloff) + 1 });
+    const movedCursor = try std.fmt.bufPrint(&buf, "\x1b[{d};{d}H", .{ (E.cursorY - E.rowoff) + 1, (E.renderX - E.coloff) + 1 });
     try ab.append(movedCursor);
 
     try ab.append("\x1b[?25h");
@@ -301,6 +389,23 @@ fn editorRefreshScreen(allocator: Allocator) !void {
     try std.io.getStdOut().writer().print("{s}", .{ab.toString()});
 }
 
+fn editorSetStatusMessage(comptime fmt: []const u8, args: anytype) !void {
+    const message = std.fmt.bufPrint(&E.statusmsg, fmt, args) catch {
+        // Handle overflow by truncating
+        const truncated = "Message too long...";
+        @memcpy(E.statusmsg[0..truncated.len], truncated);
+        E.statusmsg[truncated.len] = 0;
+        try log.logWithTimestamp("Message too long..");
+        return;
+    };
+
+    // Null-terminate the string
+    if (message.len < E.statusmsg.len) {
+        E.statusmsg[message.len] = 0;
+    }
+
+    E.statusmsg_time = std.time.timestamp();
+}
 // ------- input --------//
 
 fn enableRawMode() void {
@@ -323,7 +428,7 @@ fn enableRawMode() void {
     raw.lflag.ICANON = false;
     raw.lflag.IEXTEN = false;
     raw.cc[@intFromEnum(std.c.V.MIN)] = 0;
-    raw.cc[@intFromEnum(std.c.V.TIME)] = 1;
+    raw.cc[@intFromEnum(std.c.V.TIME)] = 0;
     if (std.c.tcsetattr(std.c.STDIN_FILENO, .FLUSH, &raw) == -1)
         die("tcsetattr");
 }
@@ -438,12 +543,22 @@ fn editorProcessKeypress() !void {
         },
 
         @intFromEnum(editorKey.PAGE_UP), @intFromEnum(editorKey.PAGE_DOWN) => {
+            if (c == @intFromEnum(editorKey.PAGE_UP)) {
+                E.cursorY = E.rowoff;
+            } else if (c == @intFromEnum(editorKey.PAGE_DOWN)) {
+                E.cursorY = E.rowoff + E.screenrows - 1;
+                if (E.cursorY > E.numrows) E.cursorY = E.numrows;
+            }
             for (0..E.screenrows) |_| {
                 editorMoveCursor(if (c == @intFromEnum(editorKey.PAGE_UP)) @intFromEnum(editorKey.ARROW_UP) else @intFromEnum(editorKey.ARROW_DOWN));
             }
         },
         @intFromEnum(editorKey.HOME_KEY) => E.cursorX = 0,
-        @intFromEnum(editorKey.END_KEY) => E.cursorX = E.screencols - 1,
+        @intFromEnum(editorKey.END_KEY) => {
+            if (E.cursorY < E.numrows) {
+                E.cursorX = @intCast(E.row[E.cursorY].chars.len);
+            }
+        },
         else => {},
     }
 }
@@ -453,11 +568,16 @@ fn editorProcessKeypress() !void {
 fn initEditor() !void {
     E.cursorX = 0;
     E.cursorY = 0;
+    E.renderX = 0;
     E.rowoff = 0;
     E.coloff = 0;
     E.numrows = 0;
     E.row = &[_]EditorRow{};
+    E.statusmsg[0] = 0;
+    E.statusmsg_time = 0;
+    E.filename = null;
     if (try getWindowSize(&E.screenrows, &E.screencols) == -1) die("getWindowSize");
+    E.screenrows -= 2;
 }
 
 fn startEditor() !void {
@@ -471,9 +591,15 @@ fn startEditor() !void {
     }
     const allocator = gpa.allocator();
 
+    log = Logger.init(allocator, "fifino.log");
+
+    try log.logSection("Fifino 25-Giu-25");
+    defer log.logSeparator() catch {};
+
     enableRawMode();
     try initEditor();
     if (std.os.argv.len > 1) try editorOpen(allocator, std.mem.span(std.os.argv[1]));
+    try editorSetStatusMessage("HELP: Ctrl-Q = quit", .{});
     while (true) {
         try editorRefreshScreen(allocator);
         try editorProcessKeypress();

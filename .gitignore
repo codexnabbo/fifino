@@ -16,5 +16,5 @@ bin/
 **/.DS_Store
 *.swp
 *~
-
+*.log
 test.zig
