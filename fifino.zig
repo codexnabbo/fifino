@@ -1,9 +1,11 @@
 const std = @import("std");
-const Logger = @import("logger.zig").Logger;
-const Config = @import("constant.zig");
-var log: Logger = undefined;
 const Allocator = std.mem.Allocator;
 
+const Config = @import("constant.zig");
+const Logger = @import("logger.zig").Logger;
+
+
+var log: Logger = undefined;
 const editorConfig = struct {
     cursorX: u16,
     cursorY: u16,
@@ -254,10 +256,10 @@ fn editorInsertRow(allocator: Allocator, at: usize, line: []const u8, len: usize
 
     E.row = try allocator.realloc(E.row, new_size);
 
-    E.row[E.numrows] = try EditorRow.init(allocator, line[0..len]);
-    E.row[E.numrows].rsize = 0;
-    E.row[E.numrows].render = undefined;
-    try editorUpdateRow(&E.row[E.numrows]);
+    E.row[at] = try EditorRow.init(allocator, line[0..len]);
+    E.row[at].rsize = 0;
+    E.row[at].render = undefined;
+    try editorUpdateRow(&E.row[at]);
     E.numrows += 1;
     E.dirty += 1;
 }
@@ -297,10 +299,11 @@ fn editorRowAppendString(row: *EditorRow, chars: []u8) !void {
 }
 
 fn editorRowDelChar(row: *EditorRow, at: usize) !void {
-    if (at < 0 and at > row.chars.len) return;
+    if (at > row.chars.len) return;
+    try log.logWithTimestampf("Before delete: pos={d}, len={d}, content='{s}'", .{ at, row.chars.len, row.chars });
     std.mem.copyForwards(u8, row.chars[at..], row.chars[at + 1 ..]);
     row.chars = try row.allocator.realloc(row.chars, row.chars.len - 1);
-    row.rsize -= 1;
+    try log.logWithTimestampf("After delete: len={d}, content='{s}'", .{ row.chars.len, row.chars });
     try editorUpdateRow(row);
     E.dirty += 1;
 }
@@ -314,14 +317,14 @@ fn editorInsertChar(allocator: Allocator, c: u16) !void {
     E.cursorX += 1;
 }
 
-fn editorInsertNewLine(allocator: Allocator) void {
+fn editorInsertNewLine(allocator: Allocator) !void {
     if (E.cursorX == 0) {
         try editorInsertRow(allocator, E.cursorY, "", 0);
     } else {
         var row: *EditorRow = &E.row[E.cursorY];
-        try editorInsertRow(allocator, E.cursorY + 1, row.chars[E.cursorY], row.chars.len - E.cursorY);
+        try editorInsertRow(allocator, E.cursorY + 1, row.chars[E.cursorX..], row.chars.len - E.cursorX);
         row = &E.row[E.cursorY];
-        row.chars[row.chars.len] = 0;
+        row.chars = try row.allocator.realloc(row.chars, E.cursorX);
         try editorUpdateRow(row);
     }
     E.cursorY += 1;
@@ -331,12 +334,14 @@ fn editorInsertNewLine(allocator: Allocator) void {
 fn editorDelChar(allocator: Allocator) !void {
     if (E.cursorY == E.numrows) return;
     if (E.cursorX == 0 and E.cursorY == 0) return;
-
+    try log.logWithTimestampf("editorDelChar: cursorY={d}, cursorX={d}, numrows={d}", .{ E.cursorY, E.cursorX, E.numrows });
     const row: *EditorRow = &E.row[E.cursorY];
     if (E.cursorX > 0) {
+        try log.logWithTimestamp("Deleting character in current row");
         try editorRowDelChar(row, E.cursorX - 1);
         E.cursorX -= 1;
     } else {
+        try log.logWithTimestamp("Moving to previous row and appending");
         E.cursorX = @intCast(E.row[E.cursorY - 1].chars.len);
         try editorRowAppendString(&E.row[E.cursorY - 1], row.chars);
         try editorDelRow(allocator, E.cursorY);
@@ -349,12 +354,17 @@ fn editorRowsToString(allocator: Allocator) ![]u8 {
     var result = std.ArrayList(u8).init(allocator);
     defer result.deinit();
 
-    for (E.row[0..E.numrows]) |row| {
+    try log.logWithTimestampf("Saving {d} rows to file", .{E.numrows});
+    for (E.row[0..E.numrows], 0..) |row, i| {
+        try log.logWithTimestampf("Row {d}: len={d}, content='{s}'", .{ i, row.chars.len, row.chars });
+
         try result.appendSlice(row.chars[0..row.chars.len]);
         try result.append('\n');
     }
+    const final_content = try result.toOwnedSlice();
 
-    return result.toOwnedSlice();
+    try log.logWithTimestampf("Final content length: {d}", .{final_content.len});
+    return final_content;
 }
 
 fn editorOpen(allocator: Allocator, file_path: []const u8) !void {
@@ -400,11 +410,17 @@ fn editorSave(allocator: Allocator) !void {
                 try editorSetStatusMessage("Save failed: Out Of Memory", .{});
                 return;
             },
+            else => {
+                try editorSetStatusMessage("Save failed: Out Of Memory", .{});
+                return;
+            },
         }
     };
     defer allocator.free(buf);
+try log.logWithTimestampf("About to save {d} bytes to file: '{s}'", .{ buf.len, E.filename.? });
+    try log.logWithTimestampf("Content preview: '{s}'", .{buf});
 
-    const fp = std.fs.cwd().createFile(E.filename.?, .{ .read = true, .truncate = false }) catch |err| {
+    const fp = std.fs.cwd().createFile(E.filename.?, .{ .read = true, .truncate = true }) catch |err| {
         switch (err) {
             error.AccessDenied => {
                 try editorSetStatusMessage("Save Failed: Access Denied", .{});
@@ -438,7 +454,7 @@ fn editorSave(allocator: Allocator) !void {
             },
         }
     };
-
+    try fp.sync();
     try editorSetStatusMessage("File saved successfully: {s}", .{E.filename.?});
     E.dirty = 0;
 }
@@ -706,7 +722,9 @@ fn editorProcessKeypress(allocator: Allocator) !void {
     const c = try editorReadKey();
 
     switch (c) {
-        '\r' => {},
+        '\r' => {
+            try editorInsertNewLine(allocator);
+        },
         ctrlKey('q') => {
             if (E.dirty > 0 and quit_times.times > 0) {
                 try editorSetStatusMessage("WARNING!!! File have unsaved changes. Press Ctrl-Q {d} more times to quit", .{quit_times.times});
@@ -723,7 +741,12 @@ fn editorProcessKeypress(allocator: Allocator) !void {
         },
 
         @intFromEnum(editorKey.BACKSPACE), ctrlKey('h'), @intFromEnum(editorKey.DEL_KEY) => {
-            if (@intFromEnum(editorKey.DEL_KEY) == c) editorMoveCursor(@intFromEnum(editorKey.ARROW_RIGHT));
+            if (@intFromEnum(editorKey.DEL_KEY) == c) {
+                editorMoveCursor(@intFromEnum(editorKey.ARROW_RIGHT));
+                try log.logWithTimestamp("DEL key pressed - moving cursor right then deleting");
+            } else {
+                try log.logWithTimestamp("BACKSPACE key pressed");
+            }
             try editorDelChar(allocator);
         },
 
