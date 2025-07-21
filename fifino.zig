@@ -14,6 +14,7 @@ const editorConfig = struct {
     screencols: u16,
     numrows: u16,
     row: []EditorRow,
+    dirty: u16,
     filename: ?[]u8,
     statusmsg: [80]u8,
     statusmsg_time: i64,
@@ -21,6 +22,7 @@ const editorConfig = struct {
 };
 
 const editorKey = enum(u16) {
+    BACKSPACE = 127,
     ARROW_LEFT = 1000,
     ARROW_RIGHT,
     ARROW_UP,
@@ -59,6 +61,17 @@ const EditorRow = struct {
 
         self.chars = try self.allocator.realloc(self.chars, new_size);
         @memcpy(self.chars[self.chars.len - s.len ..], s);
+    }
+
+    pub fn appendAt(self: *Self, c: u8, at: usize) !void {
+        const insert_pos = if (at > self.chars.len) self.chars.len else at;
+        const old_len = self.chars.len;
+        self.chars = try self.allocator.realloc(self.chars, self.chars.len + 1);
+
+        if (insert_pos < old_len) {
+            std.mem.copyBackwards(u8, self.chars[insert_pos + 1 ..], self.chars[insert_pos .. old_len - 1]);
+        }
+        self.chars[insert_pos] = c;
     }
 };
 
@@ -134,11 +147,11 @@ fn sscan(c: []u8) !void {
 
 // ------- terminal ---------//
 
-fn die(s: []const u8) void {
+fn die(s: []const u8) !void {
     _ = std.c.write(std.c.STDOUT_FILENO, "\x1b[2J", 4);
     _ = std.c.write(std.c.STDOUT_FILENO, "\x1b[H", 3);
-    std.log.err("Error trying  to compute: {s}", .{s});
-    exit(1);
+    try log.logWithTimestampf("Error trying  to compute: {s}", .{s});
+    try exit(1);
 }
 
 fn sliceUntilEnd(buf: []const u8) []const u8 {
@@ -149,12 +162,12 @@ fn sliceUntilEnd(buf: []const u8) []const u8 {
 
 fn disableRawMode() callconv(.c) void {
     if (std.c.tcsetattr(std.c.STDIN_FILENO, .FLUSH, &E.orig_termios) == -1)
-        die("tcsetattr");
+        die("tcsetattr") catch {};
 
     std.debug.print("Restore terminal settings\n", .{});
 }
 
-fn exit(i: c_int) void {
+fn exit(i: c_int) !void {
     disableRawMode();
     std.c.exit(i);
 }
@@ -224,15 +237,21 @@ fn editorUpdateRow(row: *EditorRow) !void {
         }
     }
     row.render[idx] = 0;
-    try log.logWithTimestampf("row.render = {s}", .{row.render});
-    try log.logWithTimestampf("idx length: {d}", .{idx});
     row.rsize = idx;
 }
 
-fn editorAppendRow(allocator: Allocator, line: []const u8, len: usize) !void {
+fn editorInsertRow(allocator: Allocator, at: usize, line: []const u8, len: usize) !void {
+    if (at > E.numrows) return;
+
     const new_size = std.math.mul(usize, E.numrows + 1, @sizeOf(EditorRow)) catch {
         return error.CalculationOverflow;
     };
+    E.row = try allocator.realloc(E.row, new_size);
+
+    if (at < E.numrows) {
+        std.mem.copyBackwards(EditorRow, E.row[at + 1 .. E.numrows + 1], E.row[at..E.numrows]);
+    }
+
     E.row = try allocator.realloc(E.row, new_size);
 
     E.row[E.numrows] = try EditorRow.init(allocator, line[0..len]);
@@ -240,17 +259,111 @@ fn editorAppendRow(allocator: Allocator, line: []const u8, len: usize) !void {
     E.row[E.numrows].render = undefined;
     try editorUpdateRow(&E.row[E.numrows]);
     E.numrows += 1;
+    E.dirty += 1;
 }
 
+fn editorDelRow(allocator: Allocator, at: usize) !void {
+    if (at >= E.numrows) return;
+    E.row[at].deinit();
+    if (at < E.numrows - 1) {
+        std.mem.copyForwards(EditorRow, E.row[at..], E.row[at + 1 ..]);
+    }
+    E.numrows -= 1;
+    if (E.numrows > 0) {
+        const new_size = E.numrows * @sizeOf(EditorRow);
+        E.row = try allocator.realloc(E.row, new_size);
+    } else {
+        allocator.free(E.row);
+        E.row = &[_]EditorRow{};
+    }
+
+    E.dirty += 1;
+}
+
+fn editorRowInsertChar(row: *EditorRow, at: usize, c: u8) !void {
+    const new_at = if (at < 0 or at > row.chars.len) row.chars.len else at;
+    try row.appendAt(c, new_at);
+
+    try editorUpdateRow(row);
+    E.dirty += 1;
+}
+
+fn editorRowAppendString(row: *EditorRow, chars: []u8) !void {
+    try row.append(chars);
+    try row.appendAt(0, row.chars.len);
+    try editorUpdateRow(row);
+
+    E.dirty += 1;
+}
+
+fn editorRowDelChar(row: *EditorRow, at: usize) !void {
+    if (at < 0 and at > row.chars.len) return;
+    std.mem.copyForwards(u8, row.chars[at..], row.chars[at + 1 ..]);
+    row.chars = try row.allocator.realloc(row.chars, row.chars.len - 1);
+    row.rsize -= 1;
+    try editorUpdateRow(row);
+    E.dirty += 1;
+}
+// ------- editor operations ------ //
+
+fn editorInsertChar(allocator: Allocator, c: u16) !void {
+    if (E.cursorY == E.numrows) {
+        try editorInsertRow(allocator, E.numrows, "", 0);
+    }
+    try editorRowInsertChar(&E.row[E.cursorY], E.cursorX, @intCast(c));
+    E.cursorX += 1;
+}
+
+fn editorInsertNewLine(allocator: Allocator) void {
+    if (E.cursorX == 0) {
+        try editorInsertRow(allocator, E.cursorY, "", 0);
+    } else {
+        var row: *EditorRow = &E.row[E.cursorY];
+        try editorInsertRow(allocator, E.cursorY + 1, row.chars[E.cursorY], row.chars.len - E.cursorY);
+        row = &E.row[E.cursorY];
+        row.chars[row.chars.len] = 0;
+        try editorUpdateRow(row);
+    }
+    E.cursorY += 1;
+    E.cursorX = 0;
+}
+
+fn editorDelChar(allocator: Allocator) !void {
+    if (E.cursorY == E.numrows) return;
+    if (E.cursorX == 0 and E.cursorY == 0) return;
+
+    const row: *EditorRow = &E.row[E.cursorY];
+    if (E.cursorX > 0) {
+        try editorRowDelChar(row, E.cursorX - 1);
+        E.cursorX -= 1;
+    } else {
+        E.cursorX = @intCast(E.row[E.cursorY - 1].chars.len);
+        try editorRowAppendString(&E.row[E.cursorY - 1], row.chars);
+        try editorDelRow(allocator, E.cursorY);
+        E.cursorY -= 1;
+    }
+}
 // ------- file i/o ----- //
+
+fn editorRowsToString(allocator: Allocator) ![]u8 {
+    var result = std.ArrayList(u8).init(allocator);
+    defer result.deinit();
+
+    for (E.row[0..E.numrows]) |row| {
+        try result.appendSlice(row.chars[0..row.chars.len]);
+        try result.append('\n');
+    }
+
+    return result.toOwnedSlice();
+}
 
 fn editorOpen(allocator: Allocator, file_path: []const u8) !void {
     E.filename = try allocator.dupe(u8, file_path);
     const fp = std.fs.cwd().openFile(file_path, .{ .mode = std.fs.File.OpenMode.read_only }) catch |err| {
         switch (err) {
-            error.FileNotFound => die("OpenFile: File not Found"),
-            error.AccessDenied => die("OpenFIle: Access denied"),
-            else => die("OpenFile: Unknow Error"),
+            error.FileNotFound => try die("OpenFile: File not Found"),
+            error.AccessDenied => try die("OpenFIle: Access denied"),
+            else => try die("OpenFile: Unknow Error"),
         }
         return err;
     };
@@ -269,12 +382,65 @@ fn editorOpen(allocator: Allocator, file_path: []const u8) !void {
                 while (linelen > 0 and (line[linelen - 1] == '\n' or line[linelen - 1] == '\r')) {
                     linelen -= 1;
                 }
-                try editorAppendRow(allocator, line, linelen);
+                try editorInsertRow(allocator, E.numrows, line, linelen);
             } else {
                 break;
             }
         } else |_| {}
     }
+    E.dirty = 0;
+}
+
+fn editorSave(allocator: Allocator) !void {
+    if (E.filename == null) return;
+
+    const buf = editorRowsToString(allocator) catch |err| {
+        switch (err) {
+            error.OutOfMemory => {
+                try editorSetStatusMessage("Save failed: Out Of Memory", .{});
+                return;
+            },
+        }
+    };
+    defer allocator.free(buf);
+
+    const fp = std.fs.cwd().createFile(E.filename.?, .{ .read = true, .truncate = false }) catch |err| {
+        switch (err) {
+            error.AccessDenied => {
+                try editorSetStatusMessage("Save Failed: Access Denied", .{});
+                return;
+            },
+            error.NoSpaceLeft => {
+                try editorSetStatusMessage("Save failed: No space left on device", .{});
+                return;
+            },
+            else => {
+                try editorSetStatusMessage("Save failed: Unknown error", .{});
+                return;
+            },
+        }
+    };
+    defer fp.close();
+
+    fp.writeAll(buf) catch |err| {
+        switch (err) {
+            error.AccessDenied => {
+                try editorSetStatusMessage("Save Failed: Access Denied", .{});
+                return;
+            },
+            error.NoSpaceLeft => {
+                try editorSetStatusMessage("Save failed: No space left on device", .{});
+                return;
+            },
+            else => {
+                try editorSetStatusMessage("Save failed: Unknown error", .{});
+                return;
+            },
+        }
+    };
+
+    try editorSetStatusMessage("File saved successfully: {s}", .{E.filename.?});
+    E.dirty = 0;
 }
 
 // ------- output ------- //
@@ -342,9 +508,8 @@ fn editorDrawStatusBar(ab: *abuf) !void {
 
     var buf: [80]u8 = undefined;
     var status: [80]u8 = undefined;
-    const fname = try std.fmt.bufPrint(&buf, "{s:.20} - {d} lines", .{ if (E.filename) |f| f else "[No Name]", E.numrows });
+    const fname = try std.fmt.bufPrint(&buf, "{s:.20} - {d} lines {s}", .{ if (E.filename) |f| f else "[No Name]", E.numrows, if (E.dirty > 0) "(modified)" else "" });
     const lnumber = try std.fmt.bufPrint(&status, "{d}/{d}", .{ E.cursorY + 1, E.numrows });
-    try log.logWithTimestampf("{s}", .{lnumber});
     try ab.append(fname);
 
     len = fname.len;
@@ -361,6 +526,7 @@ fn editorDrawStatusBar(ab: *abuf) !void {
 }
 
 fn editorDrawMessageBar(ab: *abuf) !void {
+    try log.logWithTimestamp("Show Message bar");
     try ab.append("\x1b[K");
 
     const msglen = if (E.statusmsg.len > E.screencols) E.screencols else E.statusmsg.len;
@@ -390,6 +556,7 @@ fn editorRefreshScreen(allocator: Allocator) !void {
 }
 
 fn editorSetStatusMessage(comptime fmt: []const u8, args: anytype) !void {
+    try log.logWithTimestampf("Message to display: {s}", .{fmt});
     const message = std.fmt.bufPrint(&E.statusmsg, fmt, args) catch {
         // Handle overflow by truncating
         const truncated = "Message too long...";
@@ -408,11 +575,12 @@ fn editorSetStatusMessage(comptime fmt: []const u8, args: anytype) !void {
 }
 // ------- input --------//
 
-fn enableRawMode() void {
+fn enableRawMode() !void {
+    try log.logWithTimestamp("[enableRawMode] starting raw mode...");
     if (std.c.tcgetattr(std.c.STDIN_FILENO, &E.orig_termios) == -1)
-        die("tcgetattr");
+        try die("tcgetattr");
     if (std.c.tcsetattr(std.c.STDIN_FILENO, .FLUSH, &E.orig_termios) == -1)
-        die("tcsetattr");
+        try die("tcsetattr");
 
     var raw = E.orig_termios;
 
@@ -430,7 +598,9 @@ fn enableRawMode() void {
     raw.cc[@intFromEnum(std.c.V.MIN)] = 0;
     raw.cc[@intFromEnum(std.c.V.TIME)] = 0;
     if (std.c.tcsetattr(std.c.STDIN_FILENO, .FLUSH, &raw) == -1)
-        die("tcsetattr");
+        try die("tcsetattr");
+
+    try log.logWithTimestamp("[enableRawMode] ... finish config");
 }
 fn editorReadKey() !u16 {
     var c: [1]u8 = undefined;
@@ -439,7 +609,7 @@ fn editorReadKey() !u16 {
         const nread = try std.posix.read(std.c.STDIN_FILENO, &c);
         if (nread == 1) break;
         if (nread == -1 and std.c._errno().* != @intFromEnum(std.c.E.AGAIN))
-            die("read");
+            try die("read");
     }
     if (c[0] == '\x1b') {
         var seq: [3]u8 = undefined;
@@ -529,17 +699,32 @@ fn editorMoveCursor(key: u16) void {
     }
 }
 
-fn editorProcessKeypress() !void {
+fn editorProcessKeypress(allocator: Allocator) !void {
+    const quit_times = struct {
+        var times: u32 = Config.QUIT_TIMES;
+    };
     const c = try editorReadKey();
 
     switch (c) {
+        '\r' => {},
         ctrlKey('q') => {
+            if (E.dirty > 0 and quit_times.times > 0) {
+                try editorSetStatusMessage("WARNING!!! File have unsaved changes. Press Ctrl-Q {d} more times to quit", .{quit_times.times});
+                quit_times.times -= 1;
+                return;
+            }
             _ = std.c.write(std.c.STDOUT_FILENO, "\x1b[2J", 4);
             _ = std.c.write(std.c.STDOUT_FILENO, "\x1b[H", 3);
-            exit(0);
+            try exit(0);
         },
+        ctrlKey('s') => try editorSave(allocator),
         @intFromEnum(editorKey.ARROW_UP), @intFromEnum(editorKey.ARROW_DOWN), @intFromEnum(editorKey.ARROW_RIGHT), @intFromEnum(editorKey.ARROW_LEFT) => |char| {
             editorMoveCursor(char);
+        },
+
+        @intFromEnum(editorKey.BACKSPACE), ctrlKey('h'), @intFromEnum(editorKey.DEL_KEY) => {
+            if (@intFromEnum(editorKey.DEL_KEY) == c) editorMoveCursor(@intFromEnum(editorKey.ARROW_RIGHT));
+            try editorDelChar(allocator);
         },
 
         @intFromEnum(editorKey.PAGE_UP), @intFromEnum(editorKey.PAGE_DOWN) => {
@@ -559,13 +744,18 @@ fn editorProcessKeypress() !void {
                 E.cursorX = @intCast(E.row[E.cursorY].chars.len);
             }
         },
-        else => {},
+        ctrlKey('l'), '\x1b' => {},
+        else => {
+            try editorInsertChar(allocator, c);
+        },
     }
+    quit_times.times = Config.QUIT_TIMES;
 }
 
 // ------- init --------//
 
 fn initEditor() !void {
+    try log.logWithTimestamp("[InitEditor()] : start Editor config)");
     E.cursorX = 0;
     E.cursorY = 0;
     E.renderX = 0;
@@ -573,11 +763,13 @@ fn initEditor() !void {
     E.coloff = 0;
     E.numrows = 0;
     E.row = &[_]EditorRow{};
+    E.dirty = 0;
     E.statusmsg[0] = 0;
     E.statusmsg_time = 0;
     E.filename = null;
-    if (try getWindowSize(&E.screenrows, &E.screencols) == -1) die("getWindowSize");
+    if (try getWindowSize(&E.screenrows, &E.screencols) == -1) try die("getWindowSize");
     E.screenrows -= 2;
+    try log.logWithTimestamp("[InitEditor()] : end Editor config)");
 }
 
 fn startEditor() !void {
@@ -596,18 +788,19 @@ fn startEditor() !void {
     try log.logSection("Fifino 25-Giu-25");
     defer log.logSeparator() catch {};
 
-    enableRawMode();
+    try enableRawMode();
     try initEditor();
     if (std.os.argv.len > 1) try editorOpen(allocator, std.mem.span(std.os.argv[1]));
-    try editorSetStatusMessage("HELP: Ctrl-Q = quit", .{});
+    try editorSetStatusMessage("HELP: Ctrl-Q = quit | Ctrl-S = save", .{});
     while (true) {
         try editorRefreshScreen(allocator);
-        try editorProcessKeypress();
+        try editorProcessKeypress(allocator);
+        try log.logWithTimestamp("Refresh all the screen");
     }
-    defer exit(0);
+    defer exit(0) catch {};
 }
 pub fn main() !void {
     startEditor() catch {
-        exit(1);
+        try exit(1);
     };
 }
